@@ -2,11 +2,9 @@
 
 GitHub 上の活動履歴から、1 日の工数をざっくり推定する CLI ツールです。
 
-![sample output](image.png)
 
 ## 前提
 
-- Python 3.14 以上
 - `gh` CLI がインストール済みであること
 - `gh auth login` または `gh auth status` が通ること
 
