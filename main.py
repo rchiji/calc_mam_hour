@@ -17,6 +17,10 @@ JST = timezone(timedelta(hours=9))
 UTC = timezone.utc
 
 
+class GhCliError(RuntimeError):
+    pass
+
+
 @dataclass
 class ActivityEvent:
     repo: str
@@ -29,6 +33,21 @@ class ActivityEvent:
     changed_lines: int = 0
 
 
+@dataclass(frozen=True)
+class EstimateConfig:
+    target_day: date
+    gap_minutes: int = 60
+    min_single_minutes: int = 20
+    event_bonus_minutes: int = 10
+    commit_bonus_threshold_lines: int = 20
+    commit_bonus_lines_per_minute: int = 25
+    max_commit_bonus_minutes: int = 30
+    include_archived: bool = False
+    all_visible_repos: bool = False
+    sleep_seconds: float = 0.0
+    verbose: bool = False
+
+
 def run_gh(args: Sequence[str]) -> Tuple[int, str, str]:
     cmd = ["gh", *args]
     try:
@@ -38,9 +57,8 @@ def run_gh(args: Sequence[str]) -> Tuple[int, str, str]:
             capture_output=True,
             text=False,
         )
-    except FileNotFoundError:
-        print("ERROR: gh CLI not found. Install GitHub CLI first.", file=sys.stderr)
-        sys.exit(2)
+    except FileNotFoundError as exc:
+        raise GhCliError("gh CLI not found. Install GitHub CLI first.") from exc
 
     stdout_text = (completed.stdout or b"").decode("utf-8", errors="replace")
     stderr_text = (completed.stderr or b"").decode("utf-8", errors="replace")
@@ -54,25 +72,18 @@ def run_gh_json(args: Sequence[str], allow_error_return: bool = False) -> Any:
         msg = stderr_text.strip() or stdout_text.strip() or "gh command failed"
         if allow_error_return:
             raise RuntimeError(msg)
-
-        print("ERROR: gh command failed.", file=sys.stderr)
-        print("Command:", " ".join(["gh", *args]), file=sys.stderr)
-        print("STDERR:", msg, file=sys.stderr)
-        sys.exit(2)
+        raise GhCliError(f"gh command failed.\nCommand: {' '.join(['gh', *args])}\nSTDERR: {msg}")
 
     if not stdout_text.strip():
         return None
 
     try:
         return json.loads(stdout_text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         msg = stdout_text[:2000]
         if allow_error_return:
             raise RuntimeError(f"Failed to parse JSON from gh output:\n{msg}")
-
-        print("ERROR: Failed to parse JSON from gh output.", file=sys.stderr)
-        print(msg, file=sys.stderr)
-        sys.exit(2)
+        raise GhCliError(f"Failed to parse JSON from gh output.\n{msg}") from exc
 
 
 def gh_api_get(
@@ -180,6 +191,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--json", action="store_true", help="Output JSON")
     p.add_argument("--verbose", action="store_true", help="Verbose logging to stderr")
     return p.parse_args()
+
+
+def config_from_args(args: argparse.Namespace) -> EstimateConfig:
+    return EstimateConfig(
+        target_day=parse_target_date(args.date),
+        gap_minutes=args.gap_minutes,
+        min_single_minutes=args.min_single_minutes,
+        event_bonus_minutes=args.event_bonus_minutes,
+        commit_bonus_threshold_lines=args.commit_bonus_threshold_lines,
+        commit_bonus_lines_per_minute=args.commit_bonus_lines_per_minute,
+        max_commit_bonus_minutes=args.max_commit_bonus_minutes,
+        include_archived=args.include_archived,
+        all_visible_repos=args.all_visible_repos,
+        sleep_seconds=args.sleep_seconds,
+        verbose=args.verbose,
+    )
 
 
 def parse_target_date(s: str) -> date:
@@ -926,18 +953,17 @@ def render_text_report(
     return "\n".join(lines)
 
 
-def main() -> None:
-    args = parse_args()
-    target_day = parse_target_date(args.date)
+def calculate_daily_estimate(config: EstimateConfig) -> Dict[str, Any]:
+    target_day = config.target_day
     since_utc, until_utc = jst_day_bounds_utc(target_day)
 
     viewer = current_viewer()
     viewer_login = viewer["login"]
 
-    if args.all_visible_repos:
+    if config.all_visible_repos:
         repos = list_all_private_repos(
-            include_archived=args.include_archived,
-            verbose=args.verbose,
+            include_archived=config.include_archived,
+            verbose=config.verbose,
         )
         scan_mode = "all_visible_private_repos"
     else:
@@ -945,12 +971,12 @@ def main() -> None:
             viewer_login=viewer_login,
             since_utc=since_utc,
             until_utc=until_utc,
-            include_archived=args.include_archived,
-            verbose=args.verbose,
+            include_archived=config.include_archived,
+            verbose=config.verbose,
         )
         scan_mode = "repos_touched_by_commit_or_issue_pr"
 
-    if args.verbose:
+    if config.verbose:
         print(f"[viewer] {viewer_login}", file=sys.stderr)
         print(f"[date] {target_day.isoformat()} JST", file=sys.stderr)
         print(f"[scan_mode] {scan_mode}", file=sys.stderr)
@@ -961,7 +987,7 @@ def main() -> None:
     for idx, repo_info in enumerate(repos, start=1):
         repo = repo_info["nameWithOwner"]
 
-        if args.verbose:
+        if config.verbose:
             print(f"[{idx}/{len(repos)}] scanning {repo}", file=sys.stderr)
 
         try:
@@ -972,7 +998,7 @@ def main() -> None:
                 viewer_login=viewer_login,
                 since_utc=since_utc,
                 until_utc=until_utc,
-                verbose=args.verbose,
+                verbose=config.verbose,
             )
 
             issue_events_raw = list_repo_issue_events(repo, since_utc=since_utc)
@@ -1009,90 +1035,122 @@ def main() -> None:
         except Exception as e:
             print(f"[warn] failed to scan {repo}: {type(e).__name__}: {e}", file=sys.stderr)
 
-        if args.sleep_seconds > 0:
-            time.sleep(args.sleep_seconds)
+        if config.sleep_seconds > 0:
+            time.sleep(config.sleep_seconds)
 
     all_events.sort(key=lambda e: e.timestamp)
 
     sessions = group_sessions(
         events=all_events,
-        gap_minutes=args.gap_minutes,
-        min_single_minutes=args.min_single_minutes,
-        event_bonus_minutes=args.event_bonus_minutes,
-        commit_bonus_threshold_lines=args.commit_bonus_threshold_lines,
-        commit_bonus_lines_per_minute=args.commit_bonus_lines_per_minute,
-        max_commit_bonus_minutes=args.max_commit_bonus_minutes,
+        gap_minutes=config.gap_minutes,
+        min_single_minutes=config.min_single_minutes,
+        event_bonus_minutes=config.event_bonus_minutes,
+        commit_bonus_threshold_lines=config.commit_bonus_threshold_lines,
+        commit_bonus_lines_per_minute=config.commit_bonus_lines_per_minute,
+        max_commit_bonus_minutes=config.max_commit_bonus_minutes,
     )
 
     total_minutes = sum(s["estimated_minutes"] for s in sessions)
     repo_estimates = estimate_minutes_by_repo(all_events, sessions)
 
+    return {
+        "target_day": target_day,
+        "viewer_login": viewer_login,
+        "scan_mode": scan_mode,
+        "repos_scanned": len(repos),
+        "all_events": all_events,
+        "sessions": sessions,
+        "repo_estimates": repo_estimates,
+        "total_estimated_minutes": total_minutes,
+        "total_estimated_hours": round(total_minutes / 60.0, 2),
+        "parameters": {
+            "gap_minutes": config.gap_minutes,
+            "min_single_minutes": config.min_single_minutes,
+            "event_bonus_minutes": config.event_bonus_minutes,
+            "commit_bonus_threshold_lines": config.commit_bonus_threshold_lines,
+            "commit_bonus_lines_per_minute": config.commit_bonus_lines_per_minute,
+            "max_commit_bonus_minutes": config.max_commit_bonus_minutes,
+            "include_archived": config.include_archived,
+            "all_visible_repos": config.all_visible_repos,
+            "sleep_seconds": config.sleep_seconds,
+        },
+    }
+
+
+def build_json_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    target_day = result["target_day"]
+    all_events = result["all_events"]
+    sessions = result["sessions"]
+
+    return {
+        "target_date_jst": target_day.isoformat(),
+        "viewer_login": result["viewer_login"],
+        "scan_mode": result["scan_mode"],
+        "repos_scanned": result["repos_scanned"],
+        "total_estimated_minutes": result["total_estimated_minutes"],
+        "total_estimated_hours": result["total_estimated_hours"],
+        "repo_estimates": result["repo_estimates"],
+        "events": [
+            {
+                "repo": e.repo,
+                "kind": e.kind,
+                "timestamp_utc": e.timestamp.astimezone(UTC).isoformat(),
+                "timestamp_jst": e.timestamp.astimezone(JST).isoformat(),
+                "detail": e.detail,
+                "commit_sha": e.commit_sha,
+                "additions": e.additions,
+                "deletions": e.deletions,
+                "changed_lines": e.changed_lines,
+            }
+            for e in all_events
+        ],
+        "sessions": [
+            {
+                "start_utc": s["start_utc"].isoformat(),
+                "end_utc": s["end_utc"].isoformat(),
+                "start_jst": s["start_jst"].isoformat(),
+                "end_jst": s["end_jst"].isoformat(),
+                "raw_span_minutes": s["raw_span_minutes"],
+                "base_minutes": s["base_minutes"],
+                "estimated_minutes": s["estimated_minutes"],
+                "has_issue_event": s["has_issue_event"],
+                "issue_bonus_minutes": s["issue_bonus_minutes"],
+                "commit_bonus_minutes": s["commit_bonus_minutes"],
+                "commit_additions": s["commit_additions"],
+                "commit_deletions": s["commit_deletions"],
+                "commit_changed_lines": s["commit_changed_lines"],
+                "event_count": len(s["events"]),
+                "repos": sorted({e.repo for e in s["events"]}),
+            }
+            for s in sessions
+        ],
+        "parameters": result["parameters"],
+    }
+
+
+def main() -> None:
+    args = parse_args()
+
+    try:
+        config = config_from_args(args)
+        result = calculate_daily_estimate(config)
+    except GhCliError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
+
     if args.json:
-        payload = {
-            "target_date_jst": target_day.isoformat(),
-            "viewer_login": viewer_login,
-            "scan_mode": scan_mode,
-            "repos_scanned": len(repos),
-            "total_estimated_minutes": total_minutes,
-            "total_estimated_hours": round(total_minutes / 60.0, 2),
-            "repo_estimates": repo_estimates,
-            "events": [
-                {
-                    "repo": e.repo,
-                    "kind": e.kind,
-                    "timestamp_utc": e.timestamp.astimezone(UTC).isoformat(),
-                    "timestamp_jst": e.timestamp.astimezone(JST).isoformat(),
-                    "detail": e.detail,
-                    "commit_sha": e.commit_sha,
-                    "additions": e.additions,
-                    "deletions": e.deletions,
-                    "changed_lines": e.changed_lines,
-                }
-                for e in all_events
-            ],
-            "sessions": [
-                {
-                    "start_utc": s["start_utc"].isoformat(),
-                    "end_utc": s["end_utc"].isoformat(),
-                    "start_jst": s["start_jst"].isoformat(),
-                    "end_jst": s["end_jst"].isoformat(),
-                    "raw_span_minutes": s["raw_span_minutes"],
-                    "base_minutes": s["base_minutes"],
-                    "estimated_minutes": s["estimated_minutes"],
-                    "has_issue_event": s["has_issue_event"],
-                    "issue_bonus_minutes": s["issue_bonus_minutes"],
-                    "commit_bonus_minutes": s["commit_bonus_minutes"],
-                    "commit_additions": s["commit_additions"],
-                    "commit_deletions": s["commit_deletions"],
-                    "commit_changed_lines": s["commit_changed_lines"],
-                    "event_count": len(s["events"]),
-                    "repos": sorted({e.repo for e in s["events"]}),
-                }
-                for s in sessions
-            ],
-            "parameters": {
-                "gap_minutes": args.gap_minutes,
-                "min_single_minutes": args.min_single_minutes,
-                "event_bonus_minutes": args.event_bonus_minutes,
-                "commit_bonus_threshold_lines": args.commit_bonus_threshold_lines,
-                "commit_bonus_lines_per_minute": args.commit_bonus_lines_per_minute,
-                "max_commit_bonus_minutes": args.max_commit_bonus_minutes,
-                "include_archived": args.include_archived,
-                "all_visible_repos": args.all_visible_repos,
-            },
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(json.dumps(build_json_payload(result), ensure_ascii=False, indent=2))
         return
 
     print(
         render_text_report(
-            target_day=target_day,
-            viewer_login=viewer_login,
-            repos_scanned=len(repos),
-            scan_mode=scan_mode,
-            all_events=all_events,
-            sessions=sessions,
-            repo_estimates=repo_estimates,
+            target_day=result["target_day"],
+            viewer_login=result["viewer_login"],
+            repos_scanned=result["repos_scanned"],
+            scan_mode=result["scan_mode"],
+            all_events=result["all_events"],
+            sessions=result["sessions"],
+            repo_estimates=result["repo_estimates"],
         )
     )
 
