@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -19,98 +20,165 @@ UTC = timezone.utc
 @dataclass
 class ActivityEvent:
     repo: str
-    kind: str
+    kind: str  # "commit" or "issue_event"
     timestamp: datetime
     detail: str
+    commit_sha: str = ""
+    additions: int = 0
+    deletions: int = 0
+    changed_lines: int = 0
 
 
-def run_gh_json(args: Sequence[str]) -> Any:
-    """
-    Run `gh ...` and parse JSON robustly.
-
-    Windows対策:
-    - text=True に任せると cp932 で落ちることがあるので bytes で受ける
-    - UTF-8 優先で decode、だめなら置換しつつ読む
-    """
+def run_gh(args: Sequence[str]) -> Tuple[int, str, str]:
     cmd = ["gh", *args]
     try:
         completed = subprocess.run(
             cmd,
-            check=True,
+            check=False,
             capture_output=True,
-            text=False,  # bytesで受ける
+            text=False,
         )
     except FileNotFoundError:
         print("ERROR: gh CLI not found. Install GitHub CLI first.", file=sys.stderr)
         sys.exit(2)
-    except subprocess.CalledProcessError as e:
-        stderr_text = (e.stderr or b"").decode("utf-8", errors="replace")
+
+    stdout_text = (completed.stdout or b"").decode("utf-8", errors="replace")
+    stderr_text = (completed.stderr or b"").decode("utf-8", errors="replace")
+    return completed.returncode, stdout_text, stderr_text
+
+
+def run_gh_json(args: Sequence[str], allow_error_return: bool = False) -> Any:
+    rc, stdout_text, stderr_text = run_gh(args)
+
+    if rc != 0:
+        msg = stderr_text.strip() or stdout_text.strip() or "gh command failed"
+        if allow_error_return:
+            raise RuntimeError(msg)
+
         print("ERROR: gh command failed.", file=sys.stderr)
-        print("Command:", " ".join(cmd), file=sys.stderr)
-        print("STDERR:", stderr_text.strip(), file=sys.stderr)
+        print("Command:", " ".join(["gh", *args]), file=sys.stderr)
+        print("STDERR:", msg, file=sys.stderr)
         sys.exit(2)
 
-    stdout_bytes = completed.stdout or b""
-    if not stdout_bytes.strip():
-        return None
-
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-    if not stdout_text:
+    if not stdout_text.strip():
         return None
 
     try:
         return json.loads(stdout_text)
     except json.JSONDecodeError:
+        msg = stdout_text[:2000]
+        if allow_error_return:
+            raise RuntimeError(f"Failed to parse JSON from gh output:\n{msg}")
+
         print("ERROR: Failed to parse JSON from gh output.", file=sys.stderr)
-        print(stdout_text[:2000], file=sys.stderr)
+        print(msg, file=sys.stderr)
         sys.exit(2)
 
 
-def gh_api_paginated(path: str, per_page: int = 100) -> List[Any]:
+def gh_api_get(
+    endpoint: str,
+    params: Optional[Dict[str, Any]] = None,
+    allow_error_return: bool = False,
+) -> Any:
+    args = ["api", "-X", "GET", endpoint]
+    for key, value in (params or {}).items():
+        if value is None:
+            continue
+        args.extend(["-f", f"{key}={value}"])
+    return run_gh_json(args, allow_error_return=allow_error_return)
+
+
+def gh_api_paginated(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    per_page: int = 100,
+) -> List[Any]:
     items: List[Any] = []
     page = 1
+
     while True:
-        sep = "&" if "?" in path else "?"
-        paged = f"{path}{sep}per_page={per_page}&page={page}"
-        data = run_gh_json(["api", paged])
+        request_params = dict(params or {})
+        request_params["per_page"] = per_page
+        request_params["page"] = page
+        request_desc = path
+
+        try:
+            if params is None:
+                sep = "&" if "?" in path else "?"
+                paged = f"{path}{sep}per_page={per_page}&page={page}"
+                request_desc = paged
+                data = run_gh_json(["api", paged], allow_error_return=True)
+            else:
+                data = gh_api_get(path, request_params, allow_error_return=True)
+                request_desc = f"{path} {request_params}"
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "http 409" in msg and "repository is empty" in msg:
+                return []
+            raise
 
         if data is None:
             break
+
         if not isinstance(data, list):
-            raise RuntimeError(f"Expected list response for path={paged}, got {type(data)}")
+            raise RuntimeError(f"Expected list response for path={request_desc}, got {type(data)}")
 
         items.extend(data)
         if len(data) < per_page:
             break
         page += 1
+
     return items
 
 
 def gh_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
     args = ["api", "graphql", "-f", f"query={query}"]
     for k, v in variables.items():
+        if v is None:
+            continue
         args.extend(["-F", f"{k}={v}"])
 
-    data = run_gh_json(args)
+    data = run_gh_json(args, allow_error_return=False)
+
     if data is None:
         raise RuntimeError("GraphQL response was empty")
     if not isinstance(data, dict):
         raise RuntimeError(f"GraphQL response was not a dict: {type(data)}")
     if "errors" in data:
         raise RuntimeError(f"GraphQL errors: {data['errors']}")
+
     return data
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Estimate daily work hours from GitHub activity.")
     p.add_argument("--date", required=True, help="YYYY-MM-DD or 'yesterday' or 'today'")
-    p.add_argument("--gap-minutes", type=int, default=60)
-    p.add_argument("--min-single-minutes", type=int, default=20)
-    p.add_argument("--event-bonus-minutes", type=int, default=10)
-    p.add_argument("--include-archived", action="store_true")
-    p.add_argument("--sleep-seconds", type=float, default=0.0)
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--gap-minutes", type=int, default=60, help="Session split gap in minutes")
+    p.add_argument("--min-single-minutes", type=int, default=20, help="Minimum minutes for single-event session")
+    p.add_argument("--event-bonus-minutes", type=int, default=10, help="Bonus minutes if session has issue/PR event")
+    p.add_argument(
+        "--commit-bonus-threshold-lines",
+        type=int,
+        default=20,
+        help="Ignore the first N changed lines in a session before commit bonus starts",
+    )
+    p.add_argument(
+        "--commit-bonus-lines-per-minute",
+        type=int,
+        default=25,
+        help="Changed lines per 1 extra bonus minute after the threshold",
+    )
+    p.add_argument(
+        "--max-commit-bonus-minutes",
+        type=int,
+        default=30,
+        help="Maximum commit diff bonus minutes per session",
+    )
+    p.add_argument("--include-archived", action="store_true", help="Include archived repos")
+    p.add_argument("--all-visible-repos", action="store_true", help="Scan all visible private repos")
+    p.add_argument("--sleep-seconds", type=float, default=0.0, help="Sleep between repo scans")
+    p.add_argument("--json", action="store_true", help="Output JSON")
+    p.add_argument("--verbose", action="store_true", help="Verbose logging to stderr")
     return p.parse_args()
 
 
@@ -124,14 +192,31 @@ def parse_target_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def jst_day_bounds_utc(target_day: date) -> Tuple[datetime, datetime]:
+def jst_day_bounds(target_day: date) -> Tuple[datetime, datetime]:
     start_jst = datetime.combine(target_day, dtime.min, tzinfo=JST)
     end_jst = datetime.combine(target_day, dtime.max, tzinfo=JST)
+    return start_jst, end_jst
+
+
+def jst_day_bounds_utc(target_day: date) -> Tuple[datetime, datetime]:
+    start_jst, end_jst = jst_day_bounds(target_day)
     return start_jst.astimezone(UTC), end_jst.astimezone(UTC)
 
 
 def isoformat_z(dt: datetime) -> str:
     return dt.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_github_datetime(raw: Optional[str]) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
 
 
 def current_viewer() -> Dict[str, Any]:
@@ -190,20 +275,256 @@ def list_all_private_repos(include_archived: bool = False, verbose: bool = False
 
         if not payload["pageInfo"]["hasNextPage"]:
             break
+
         cursor = payload["pageInfo"]["endCursor"]
 
     repos.sort(key=lambda r: r["nameWithOwner"].lower())
     return repos
 
 
+def _repo_obj(full_name: str, archived: bool = False) -> Dict[str, Any]:
+    return {
+        "nameWithOwner": full_name,
+        "isArchived": archived,
+        "isPrivate": True,
+        "viewerPermission": None,
+    }
+
+
+def search_api_all(
+    endpoint: str,
+    params: Dict[str, Any],
+    per_page: int = 100,
+    max_pages: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Generic paginated search collector.
+    GitHub search API usually returns:
+      { "total_count": ..., "items": [...] }
+    """
+    items: List[Dict[str, Any]] = []
+    for page in range(1, max_pages + 1):
+        request_params = dict(params)
+        request_params["per_page"] = per_page
+        request_params["page"] = page
+        data = gh_api_get(endpoint, request_params, allow_error_return=True)
+        if not isinstance(data, dict):
+            break
+        batch = data.get("items") or []
+        if not isinstance(batch, list) or not batch:
+            break
+        items.extend(batch)
+        if len(batch) < per_page:
+            break
+    return items
+
+
+def search_repos_by_commit(
+    viewer_login: str,
+    since_utc: datetime,
+    until_utc: datetime,
+    include_archived: bool = False,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    query = f"author:{viewer_login} committer-date:{isoformat_z(since_utc)}..{isoformat_z(until_utc)} is:private"
+
+    try:
+        items = search_api_all(
+            endpoint="search/commits",
+            params={
+                "q": query,
+                "sort": "committer-date",
+                "order": "desc",
+            },
+            per_page=100,
+            max_pages=10,
+        )
+    except RuntimeError as e:
+        if verbose:
+            print(f"[warn] commit search failed: {e}", file=sys.stderr)
+        return []
+
+    repo_map: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        repo_info = item.get("repository") or {}
+        full_name = repo_info.get("full_name")
+        if not full_name:
+            continue
+        archived = bool(repo_info.get("archived", False))
+        if not include_archived and archived:
+            continue
+        repo_map[full_name] = _repo_obj(full_name, archived=archived)
+
+    repos = sorted(repo_map.values(), key=lambda r: r["nameWithOwner"].lower())
+    if verbose:
+        print(f"[repos] touched-by-commit total={len(repos)}", file=sys.stderr)
+    return repos
+
+
+def search_repos_by_issue_pr(
+    viewer_login: str,
+    since_utc: datetime,
+    until_utc: datetime,
+    include_archived: bool = False,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Repos where the user touched issues / PRs during the UTC-converted JST day range.
+
+    We use a UTC timestamp range:
+      updated:START..END
+
+    Queries:
+      - commenter:<you>
+      - author:<you>
+      - assignee:<you>
+      - involves:<you>
+      - reviewed-by:<you>   # for PR review activity
+      - review-requested:<you> # optional signal that PR touched your workflow
+    """
+    updated_range = f"{isoformat_z(since_utc)}..{isoformat_z(until_utc)}"
+
+    queries = [
+        f"commenter:{viewer_login} updated:{updated_range} is:private",
+        f"author:{viewer_login} updated:{updated_range} is:private",
+        f"assignee:{viewer_login} updated:{updated_range} is:private",
+        f"involves:{viewer_login} updated:{updated_range} is:private",
+        f"reviewed-by:{viewer_login} updated:{updated_range} is:private is:pr",
+    ]
+
+    repo_map: Dict[str, Dict[str, Any]] = {}
+
+    for q in queries:
+        try:
+            items = search_api_all(
+                endpoint="search/issues",
+                params={
+                    "q": q,
+                    "sort": "updated",
+                    "order": "desc",
+                },
+                per_page=100,
+                max_pages=10,
+            )
+        except RuntimeError as e:
+            if verbose:
+                print(f"[warn] issue/pr search failed for query={q!r}: {e}", file=sys.stderr)
+            continue
+
+        for item in items:
+            repo_url = item.get("repository_url") or ""
+            if "/repos/" not in repo_url:
+                continue
+            full_name = repo_url.split("/repos/", 1)[1].strip("/")
+            if not full_name:
+                continue
+            repo_map[full_name] = _repo_obj(full_name, archived=False)
+
+    repos = sorted(repo_map.values(), key=lambda r: r["nameWithOwner"].lower())
+    if verbose:
+        print(f"[repos] touched-by-issue-pr total={len(repos)}", file=sys.stderr)
+    return repos
+
+
+def search_touched_repos(
+    viewer_login: str,
+    since_utc: datetime,
+    until_utc: datetime,
+    include_archived: bool = False,
+    verbose: bool = False,
+) -> List[Dict[str, Any]]:
+    repo_map: Dict[str, Dict[str, Any]] = {}
+
+    for repo in search_repos_by_commit(
+        viewer_login=viewer_login,
+        since_utc=since_utc,
+        until_utc=until_utc,
+        include_archived=include_archived,
+        verbose=verbose,
+    ):
+        repo_map[repo["nameWithOwner"]] = repo
+
+    for repo in search_repos_by_issue_pr(
+        viewer_login=viewer_login,
+        since_utc=since_utc,
+        until_utc=until_utc,
+        include_archived=include_archived,
+        verbose=verbose,
+    ):
+        repo_map[repo["nameWithOwner"]] = repo
+
+    repos = sorted(repo_map.values(), key=lambda r: r["nameWithOwner"].lower())
+    if verbose:
+        print(f"[repos] touched-total={len(repos)}", file=sys.stderr)
+    return repos
+
+
 def list_repo_commits(repo: str, since_utc: datetime, until_utc: datetime) -> List[Dict[str, Any]]:
-    path = f"repos/{repo}/commits" f"?since={isoformat_z(since_utc)}" f"&until={isoformat_z(until_utc)}"
-    return gh_api_paginated(path)
+    return gh_api_paginated(
+        f"repos/{repo}/commits",
+        params={
+            "since": isoformat_z(since_utc),
+            "until": isoformat_z(until_utc),
+        },
+    )
 
 
-def list_repo_issue_events(repo: str) -> List[Dict[str, Any]]:
-    path = f"repos/{repo}/issues/events"
-    return gh_api_paginated(path)
+def get_repo_commit_detail(repo: str, sha: str) -> Dict[str, Any]:
+    data = gh_api_get(f"repos/{repo}/commits/{sha}", allow_error_return=True)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Expected dict response for commit detail repo={repo} sha={sha}, got {type(data)}")
+    return data
+
+
+def list_repo_issue_events(repo: str, since_utc: datetime) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    page = 1
+    per_page = 100
+
+    while True:
+        batch = gh_api_get(
+            f"repos/{repo}/issues/events",
+            params={"per_page": per_page, "page": page},
+            allow_error_return=True,
+        )
+        if batch is None:
+            break
+        if not isinstance(batch, list):
+            raise RuntimeError(f"Expected list response for repo issue events: {type(batch)}")
+        if not batch:
+            break
+
+        items.extend(batch)
+
+        oldest_ts = None
+        for ev in batch:
+            ts = parse_github_datetime(ev.get("created_at"))
+            if ts is None:
+                continue
+            if oldest_ts is None or ts < oldest_ts:
+                oldest_ts = ts
+
+        if len(batch) < per_page:
+            break
+        if oldest_ts is not None and oldest_ts < since_utc:
+            break
+        page += 1
+
+    return items
+
+
+def list_repo_issue_comments(repo: str, since_utc: datetime) -> List[Dict[str, Any]]:
+    return gh_api_paginated(
+        f"repos/{repo}/issues/comments",
+        params={"since": isoformat_z(since_utc)},
+    )
+
+
+def list_repo_pull_review_comments(repo: str, since_utc: datetime) -> List[Dict[str, Any]]:
+    return gh_api_paginated(
+        f"repos/{repo}/pulls/comments",
+        params={"since": isoformat_z(since_utc)},
+    )
 
 
 def extract_commit_events(
@@ -212,6 +533,7 @@ def extract_commit_events(
     viewer_login: str,
     since_utc: datetime,
     until_utc: datetime,
+    verbose: bool = False,
 ) -> List[ActivityEvent]:
     out: List[ActivityEvent] = []
 
@@ -226,14 +548,9 @@ def extract_commit_events(
         if not commit_time_raw:
             continue
 
-        try:
-            ts = datetime.fromisoformat(commit_time_raw.replace("Z", "+00:00"))
-        except ValueError:
+        ts = parse_github_datetime(commit_time_raw)
+        if ts is None:
             continue
-
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=UTC)
-        ts = ts.astimezone(UTC)
 
         if not (since_utc <= ts <= until_utc):
             continue
@@ -241,9 +558,37 @@ def extract_commit_events(
         if author_login != viewer_login:
             continue
 
-        sha = (c.get("sha") or "")[:7]
-        msg = ((commit_info.get("message") or "").splitlines() or [""])[0]
-        out.append(ActivityEvent(repo=repo, kind="commit", timestamp=ts, detail=f"{sha} {msg}".strip()))
+        sha_full = c.get("sha") or ""
+        sha = sha_full[:7]
+        msg = ((commit_info.get("message") or "").splitlines() or [""])[0].strip()
+        detail = f"{sha} {msg}".strip()
+
+        additions = 0
+        deletions = 0
+        changed_lines = 0
+        if sha_full:
+            try:
+                commit_detail = get_repo_commit_detail(repo, sha_full)
+                stats = commit_detail.get("stats") or {}
+                additions = max(0, int(stats.get("additions") or 0))
+                deletions = max(0, int(stats.get("deletions") or 0))
+                changed_lines = max(0, int(stats.get("total") or (additions + deletions)))
+            except Exception as e:
+                if verbose:
+                    print(f"[warn] failed to fetch commit stats {repo}@{sha}: {type(e).__name__}: {e}", file=sys.stderr)
+
+        out.append(
+            ActivityEvent(
+                repo=repo,
+                kind="commit",
+                timestamp=ts,
+                detail=detail,
+                commit_sha=sha_full,
+                additions=additions,
+                deletions=deletions,
+                changed_lines=changed_lines,
+            )
+        )
 
     return out
 
@@ -263,29 +608,87 @@ def extract_issue_events(
         if actor_login != viewer_login:
             continue
 
-        created_raw = ev.get("created_at")
-        if not created_raw:
+        ts = parse_github_datetime(ev.get("created_at"))
+        if ts is None:
             continue
-
-        try:
-            ts = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=UTC)
-        ts = ts.astimezone(UTC)
 
         if not (since_utc <= ts <= until_utc):
             continue
 
-        event_name = ev.get("event") or "unknown"
+        event_name = (ev.get("event") or "unknown").strip()
         issue = ev.get("issue") or {}
         number = issue.get("number")
         html_url = issue.get("html_url") or ""
+
         detail = event_name
         if number is not None:
             detail += f" #{number}"
+        if html_url:
+            detail += f" {html_url}"
+
+        out.append(ActivityEvent(repo=repo, kind="issue_event", timestamp=ts, detail=detail))
+
+    return out
+
+
+def extract_issue_comment_events(
+    repo: str,
+    comments: Iterable[Dict[str, Any]],
+    viewer_login: str,
+    since_utc: datetime,
+    until_utc: datetime,
+) -> List[ActivityEvent]:
+    out: List[ActivityEvent] = []
+
+    for comment in comments:
+        user = comment.get("user") or {}
+        if user.get("login") != viewer_login:
+            continue
+
+        ts = parse_github_datetime(comment.get("created_at"))
+        if ts is None or not (since_utc <= ts <= until_utc):
+            continue
+
+        issue_url = (comment.get("issue_url") or "").rstrip("/")
+        issue_number = issue_url.rsplit("/", 1)[-1] if issue_url else ""
+        html_url = comment.get("html_url") or ""
+
+        detail = "comment"
+        if issue_number.isdigit():
+            detail += f" #{issue_number}"
+        if html_url:
+            detail += f" {html_url}"
+
+        out.append(ActivityEvent(repo=repo, kind="issue_event", timestamp=ts, detail=detail))
+
+    return out
+
+
+def extract_pull_review_comment_events(
+    repo: str,
+    comments: Iterable[Dict[str, Any]],
+    viewer_login: str,
+    since_utc: datetime,
+    until_utc: datetime,
+) -> List[ActivityEvent]:
+    out: List[ActivityEvent] = []
+
+    for comment in comments:
+        user = comment.get("user") or {}
+        if user.get("login") != viewer_login:
+            continue
+
+        ts = parse_github_datetime(comment.get("created_at"))
+        if ts is None or not (since_utc <= ts <= until_utc):
+            continue
+
+        pr_url = (comment.get("pull_request_url") or "").rstrip("/")
+        pr_number = pr_url.rsplit("/", 1)[-1] if pr_url else ""
+        html_url = comment.get("html_url") or ""
+
+        detail = "review_comment"
+        if pr_number.isdigit():
+            detail += f" PR#{pr_number}"
         if html_url:
             detail += f" {html_url}"
 
@@ -299,13 +702,17 @@ def group_sessions(
     gap_minutes: int,
     min_single_minutes: int,
     event_bonus_minutes: int,
+    commit_bonus_threshold_lines: int,
+    commit_bonus_lines_per_minute: int,
+    max_commit_bonus_minutes: int,
 ) -> List[Dict[str, Any]]:
     if not events:
         return []
 
     events = sorted(events, key=lambda e: e.timestamp)
+
     sessions: List[List[ActivityEvent]] = []
-    current = [events[0]]
+    current: List[ActivityEvent] = [events[0]]
 
     for ev in events[1:]:
         prev = current[-1]
@@ -315,6 +722,7 @@ def group_sessions(
             current = [ev]
         else:
             current.append(ev)
+
     sessions.append(current)
 
     out: List[Dict[str, Any]] = []
@@ -324,8 +732,24 @@ def group_sessions(
         raw_minutes = (end - start).total_seconds() / 60.0
         base_minutes = max(raw_minutes, float(min_single_minutes))
         has_issue_event = any(e.kind == "issue_event" for e in sess)
-        bonus = event_bonus_minutes if has_issue_event else 0
-        est_minutes = int(round(base_minutes + bonus))
+        issue_bonus_minutes = event_bonus_minutes if has_issue_event else 0
+        unique_commits: Dict[str, ActivityEvent] = {}
+        for ev in sess:
+            if ev.kind != "commit":
+                continue
+            commit_key = ev.commit_sha or f"{ev.repo}:{ev.detail}"
+            unique_commits.setdefault(commit_key, ev)
+
+        commit_changed_lines = sum(ev.changed_lines for ev in unique_commits.values())
+        commit_additions = sum(ev.additions for ev in unique_commits.values())
+        commit_deletions = sum(ev.deletions for ev in unique_commits.values())
+        commit_bonus_minutes = estimate_commit_bonus_minutes(
+            changed_lines=commit_changed_lines,
+            threshold_lines=commit_bonus_threshold_lines,
+            lines_per_minute=commit_bonus_lines_per_minute,
+            max_bonus_minutes=max_commit_bonus_minutes,
+        )
+        est_minutes = int(round(base_minutes + issue_bonus_minutes + commit_bonus_minutes))
 
         out.append(
             {
@@ -334,11 +758,18 @@ def group_sessions(
                 "start_jst": start.astimezone(JST),
                 "end_jst": end.astimezone(JST),
                 "raw_span_minutes": round(raw_minutes, 1),
+                "base_minutes": round(base_minutes, 1),
                 "estimated_minutes": est_minutes,
                 "has_issue_event": has_issue_event,
+                "issue_bonus_minutes": issue_bonus_minutes,
+                "commit_bonus_minutes": commit_bonus_minutes,
+                "commit_additions": commit_additions,
+                "commit_deletions": commit_deletions,
+                "commit_changed_lines": commit_changed_lines,
                 "events": sess,
             }
         )
+
     return out
 
 
@@ -349,26 +780,105 @@ def summarize_by_repo(events: List[ActivityEvent]) -> Dict[str, Dict[str, int]]:
     return dict(summary)
 
 
+def estimate_commit_bonus_minutes(
+    changed_lines: int,
+    threshold_lines: int,
+    lines_per_minute: int,
+    max_bonus_minutes: int,
+) -> int:
+    threshold_lines = max(0, threshold_lines)
+    lines_per_minute = max(1, lines_per_minute)
+    max_bonus_minutes = max(0, max_bonus_minutes)
+
+    effective_lines = max(0, changed_lines - threshold_lines)
+    if effective_lines <= 0:
+        return 0
+
+    bonus_minutes = math.ceil(effective_lines / lines_per_minute)
+    return min(max_bonus_minutes, bonus_minutes)
+
+
+def estimate_minutes_by_repo(events: List[ActivityEvent], sessions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    repo_stats: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "estimated_minutes": 0.0,
+            "session_count": 0,
+            "commit_count": 0,
+            "issue_event_count": 0,
+            "event_count": 0,
+            "commit_additions": 0,
+            "commit_deletions": 0,
+            "commit_changed_lines": 0,
+        }
+    )
+
+    for e in events:
+        repo_stats[e.repo]["event_count"] += 1
+        if e.kind == "commit":
+            repo_stats[e.repo]["commit_count"] += 1
+            repo_stats[e.repo]["commit_additions"] += e.additions
+            repo_stats[e.repo]["commit_deletions"] += e.deletions
+            repo_stats[e.repo]["commit_changed_lines"] += e.changed_lines
+        elif e.kind == "issue_event":
+            repo_stats[e.repo]["issue_event_count"] += 1
+
+    for sess in sessions:
+        repo_counts: Dict[str, int] = defaultdict(int)
+        for e in sess["events"]:
+            repo_counts[e.repo] += 1
+
+        total_events = sum(repo_counts.values())
+        if total_events <= 0:
+            continue
+
+        for repo, count in repo_counts.items():
+            allocated = sess["estimated_minutes"] * (count / total_events)
+            repo_stats[repo]["estimated_minutes"] += allocated
+            repo_stats[repo]["session_count"] += 1
+
+    for repo in repo_stats:
+        repo_stats[repo]["estimated_minutes"] = round(repo_stats[repo]["estimated_minutes"], 1)
+        repo_stats[repo]["estimated_hours"] = round(repo_stats[repo]["estimated_minutes"] / 60.0, 2)
+
+    return dict(sorted(repo_stats.items(), key=lambda kv: (-kv[1]["estimated_minutes"], kv[0].lower())))
+
+
 def render_text_report(
     target_day: date,
     viewer_login: str,
     repos_scanned: int,
+    scan_mode: str,
     all_events: List[ActivityEvent],
     sessions: List[Dict[str, Any]],
+    repo_estimates: Dict[str, Dict[str, Any]],
 ) -> str:
     lines: List[str] = []
     lines.append(f"GitHub daily work estimate for {target_day.isoformat()} (JST)")
     lines.append(f"Viewer: {viewer_login}")
+    lines.append(f"Scan mode: {scan_mode}")
     lines.append(f"Repos scanned: {repos_scanned}")
     lines.append("")
 
     if not all_events:
         lines.append("No matching GitHub activity found.")
-        lines.append("Estimated work: 0.0 h")
+        lines.append("Estimated work: 0.00 h")
         return "\n".join(lines)
 
     repo_summary = summarize_by_repo(all_events)
     total_minutes = sum(s["estimated_minutes"] for s in sessions)
+
+    lines.append("Repository estimates:")
+    for repo, stats in repo_estimates.items():
+        lines.append(
+            f"  - {repo}: "
+            f"{stats['estimated_hours']:.2f} h "
+            f"({stats['estimated_minutes']:.1f} min), "
+            f"sessions={stats['session_count']}, "
+            f"commits={stats['commit_count']}, "
+            f"issue_events={stats['issue_event_count']}, "
+            f"changed_lines={stats['commit_changed_lines']}"
+        )
+    lines.append("")
 
     lines.append("Repo summary:")
     for repo in sorted(repo_summary):
@@ -381,18 +891,38 @@ def render_text_report(
     for idx, s in enumerate(sessions, start=1):
         start_jst = s["start_jst"].strftime("%H:%M")
         end_jst = s["end_jst"].strftime("%H:%M")
+        session_repos = sorted({e.repo for e in s["events"]})
         lines.append(
             f"  {idx}. {start_jst}-{end_jst} JST | "
             f"raw_span={s['raw_span_minutes']} min | "
+            f"base={s['base_minutes']} min | "
             f"estimated={s['estimated_minutes']} min | "
-            f"issue_bonus={'yes' if s['has_issue_event'] else 'no'}"
+            f"issue_bonus={s['issue_bonus_minutes']} min | "
+            f"commit_bonus={s['commit_bonus_minutes']} min | "
+            f"changed_lines={s['commit_changed_lines']} | "
+            f"repos={', '.join(session_repos)}"
         )
         for ev in s["events"]:
             t = ev.timestamp.astimezone(JST).strftime("%H:%M:%S")
-            lines.append(f"     - [{t}] {ev.repo} {ev.kind}: {ev.detail}")
+            if ev.kind == "commit":
+                diff_text = (
+                    f" (+{ev.additions}/-{ev.deletions}, total={ev.changed_lines})"
+                    if ev.changed_lines > 0
+                    else ""
+                )
+            else:
+                diff_text = ""
+            lines.append(f"     - [{t}] {ev.repo} {ev.kind}: {ev.detail}{diff_text}")
 
     lines.append("")
-    lines.append(f"Estimated work: {total_minutes / 60.0:.2f} h ({total_minutes} min)")
+    lines.append(f"Estimated work total: {total_minutes / 60.0:.2f} h ({total_minutes} min)")
+    lines.append("")
+    lines.append("Caveats:")
+    lines.append("  - This is estimated from GitHub-visible activity only.")
+    lines.append("  - Local investigation / experiments without commits or issue activity are not counted.")
+    lines.append("  - Default scan target is repos touched by your commits or issue/PR activity on that day.")
+    lines.append("  - Repo-wise time is allocated by event share within each session.")
+
     return "\n".join(lines)
 
 
@@ -403,20 +933,34 @@ def main() -> None:
 
     viewer = current_viewer()
     viewer_login = viewer["login"]
-    repos = list_all_private_repos(
-        include_archived=args.include_archived,
-        verbose=args.verbose,
-    )
+
+    if args.all_visible_repos:
+        repos = list_all_private_repos(
+            include_archived=args.include_archived,
+            verbose=args.verbose,
+        )
+        scan_mode = "all_visible_private_repos"
+    else:
+        repos = search_touched_repos(
+            viewer_login=viewer_login,
+            since_utc=since_utc,
+            until_utc=until_utc,
+            include_archived=args.include_archived,
+            verbose=args.verbose,
+        )
+        scan_mode = "repos_touched_by_commit_or_issue_pr"
 
     if args.verbose:
         print(f"[viewer] {viewer_login}", file=sys.stderr)
         print(f"[date] {target_day.isoformat()} JST", file=sys.stderr)
+        print(f"[scan_mode] {scan_mode}", file=sys.stderr)
         print(f"[repos] total={len(repos)}", file=sys.stderr)
 
     all_events: List[ActivityEvent] = []
 
     for idx, repo_info in enumerate(repos, start=1):
         repo = repo_info["nameWithOwner"]
+
         if args.verbose:
             print(f"[{idx}/{len(repos)}] scanning {repo}", file=sys.stderr)
 
@@ -428,9 +972,10 @@ def main() -> None:
                 viewer_login=viewer_login,
                 since_utc=since_utc,
                 until_utc=until_utc,
+                verbose=args.verbose,
             )
 
-            issue_events_raw = list_repo_issue_events(repo)
+            issue_events_raw = list_repo_issue_events(repo, since_utc=since_utc)
             issue_events = extract_issue_events(
                 repo=repo,
                 events=issue_events_raw,
@@ -439,31 +984,58 @@ def main() -> None:
                 until_utc=until_utc,
             )
 
-            all_events.extend(commit_events)
-            all_events.extend(issue_events)
+            issue_comments_raw = list_repo_issue_comments(repo, since_utc=since_utc)
+            issue_comment_events = extract_issue_comment_events(
+                repo=repo,
+                comments=issue_comments_raw,
+                viewer_login=viewer_login,
+                since_utc=since_utc,
+                until_utc=until_utc,
+            )
+
+            pull_review_comments_raw = list_repo_pull_review_comments(repo, since_utc=since_utc)
+            pull_review_comment_events = extract_pull_review_comment_events(
+                repo=repo,
+                comments=pull_review_comments_raw,
+                viewer_login=viewer_login,
+                since_utc=since_utc,
+                until_utc=until_utc,
+            )
+
+            repo_events = commit_events + issue_events + issue_comment_events + pull_review_comment_events
+            if repo_events:
+                all_events.extend(repo_events)
 
         except Exception as e:
-            print(f"[warn] failed to scan {repo}: {e}", file=sys.stderr)
+            print(f"[warn] failed to scan {repo}: {type(e).__name__}: {e}", file=sys.stderr)
 
         if args.sleep_seconds > 0:
             time.sleep(args.sleep_seconds)
 
     all_events.sort(key=lambda e: e.timestamp)
+
     sessions = group_sessions(
         events=all_events,
         gap_minutes=args.gap_minutes,
         min_single_minutes=args.min_single_minutes,
         event_bonus_minutes=args.event_bonus_minutes,
+        commit_bonus_threshold_lines=args.commit_bonus_threshold_lines,
+        commit_bonus_lines_per_minute=args.commit_bonus_lines_per_minute,
+        max_commit_bonus_minutes=args.max_commit_bonus_minutes,
     )
+
     total_minutes = sum(s["estimated_minutes"] for s in sessions)
+    repo_estimates = estimate_minutes_by_repo(all_events, sessions)
 
     if args.json:
         payload = {
             "target_date_jst": target_day.isoformat(),
             "viewer_login": viewer_login,
+            "scan_mode": scan_mode,
             "repos_scanned": len(repos),
             "total_estimated_minutes": total_minutes,
             "total_estimated_hours": round(total_minutes / 60.0, 2),
+            "repo_estimates": repo_estimates,
             "events": [
                 {
                     "repo": e.repo,
@@ -471,6 +1043,10 @@ def main() -> None:
                     "timestamp_utc": e.timestamp.astimezone(UTC).isoformat(),
                     "timestamp_jst": e.timestamp.astimezone(JST).isoformat(),
                     "detail": e.detail,
+                    "commit_sha": e.commit_sha,
+                    "additions": e.additions,
+                    "deletions": e.deletions,
+                    "changed_lines": e.changed_lines,
                 }
                 for e in all_events
             ],
@@ -481,18 +1057,28 @@ def main() -> None:
                     "start_jst": s["start_jst"].isoformat(),
                     "end_jst": s["end_jst"].isoformat(),
                     "raw_span_minutes": s["raw_span_minutes"],
+                    "base_minutes": s["base_minutes"],
                     "estimated_minutes": s["estimated_minutes"],
                     "has_issue_event": s["has_issue_event"],
+                    "issue_bonus_minutes": s["issue_bonus_minutes"],
+                    "commit_bonus_minutes": s["commit_bonus_minutes"],
+                    "commit_additions": s["commit_additions"],
+                    "commit_deletions": s["commit_deletions"],
+                    "commit_changed_lines": s["commit_changed_lines"],
                     "event_count": len(s["events"]),
+                    "repos": sorted({e.repo for e in s["events"]}),
                 }
                 for s in sessions
             ],
-            "repo_summary": summarize_by_repo(all_events),
             "parameters": {
                 "gap_minutes": args.gap_minutes,
                 "min_single_minutes": args.min_single_minutes,
                 "event_bonus_minutes": args.event_bonus_minutes,
+                "commit_bonus_threshold_lines": args.commit_bonus_threshold_lines,
+                "commit_bonus_lines_per_minute": args.commit_bonus_lines_per_minute,
+                "max_commit_bonus_minutes": args.max_commit_bonus_minutes,
                 "include_archived": args.include_archived,
+                "all_visible_repos": args.all_visible_repos,
             },
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -503,8 +1089,10 @@ def main() -> None:
             target_day=target_day,
             viewer_login=viewer_login,
             repos_scanned=len(repos),
+            scan_mode=scan_mode,
             all_events=all_events,
             sessions=sessions,
+            repo_estimates=repo_estimates,
         )
     )
 
