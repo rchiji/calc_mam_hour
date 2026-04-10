@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 from typing import Any, Dict, List
 
 import altair as alt
 import pandas as pd
 import streamlit as st
-from streamlit.errors import StreamlitSecretNotFoundError
 
 from main import (
     JST,
@@ -17,6 +15,7 @@ from main import (
     GhCliError,
     build_json_payload,
     calculate_daily_estimate,
+    get_gh_auth_status,
     render_text_report,
 )
 
@@ -27,20 +26,9 @@ st.set_page_config(
 )
 
 
-def read_streamlit_secret(name: str) -> str:
-    try:
-        return str(st.secrets[name])
-    except (KeyError, StreamlitSecretNotFoundError):
-        return ""
-
-
-gh_token = read_streamlit_secret("GH_TOKEN") or read_streamlit_secret("GITHUB_TOKEN")
-if gh_token:
-    os.environ["GH_TOKEN"] = gh_token
-
-
 @st.cache_data(ttl=300, show_spinner=False)
 def run_estimate(
+    auth_identity: str,
     target_day_iso: str,
     gap_minutes: int,
     min_single_minutes: int,
@@ -51,6 +39,7 @@ def run_estimate(
     include_archived: bool,
     all_visible_repos: bool,
 ) -> Dict[str, Any]:
+    _ = auth_identity
     config = EstimateConfig(
         target_day=datetime.fromisoformat(target_day_iso).date(),
         gap_minutes=gap_minutes,
@@ -152,13 +141,37 @@ def event_rows(events: List[Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+gh_status = get_gh_auth_status()
+gh_login = gh_status["login"].strip()
+gh_identity = gh_login or gh_status["detail"] or "gh"
+
 st.title("GitHub Daily Work Estimator")
-st.caption("GitHub activity から 1 日の工数を推定します。`gh` CLI と認証はブラウザではなく Streamlit サーバー側で使われます。")
+st.caption("Estimate daily work time from GitHub activity using the local GitHub CLI session.")
 
 with st.sidebar:
+    st.header("Authentication")
+    if gh_status["authenticated"]:
+        st.success(f"Using `gh` login `{gh_login or 'authenticated user'}`")
+    else:
+        st.error(gh_status["detail"])
+        st.code("gh auth login")
+
+    if gh_status["version"]:
+        st.caption(gh_status["version"])
+
+    with st.expander("How this works", expanded=False):
+        st.markdown(
+            """
+- This build uses the local `gh` session for the current user.
+- Run `gh auth login` once in a terminal before starting Streamlit.
+- Token input and GitHub OAuth are not used in this local build.
+"""
+        )
+
+    st.divider()
     st.header("Parameters")
     with st.form("estimate_form"):
-        target_day = st.date_input("対象日 (JST)", value=datetime.now(JST).date())
+        target_day = st.date_input("Target Date (JST)", value=datetime.now(JST).date())
         gap_minutes = st.number_input("Session Gap (min)", min_value=1, max_value=24 * 60, value=60, step=5)
         min_single_minutes = st.number_input("Minimum Session (min)", min_value=0, max_value=24 * 60, value=20, step=5)
         event_bonus_minutes = st.number_input("Issue/PR Bonus (min)", min_value=0, max_value=240, value=10, step=1)
@@ -190,24 +203,18 @@ with st.sidebar:
         all_visible_repos = st.checkbox("Scan all visible private repos", value=False)
         submitted = st.form_submit_button("Estimate", use_container_width=True)
 
-    st.divider()
-    st.markdown(
-        """
-公開運用の前提:
-
-- `gh` はエンドユーザーの端末ではなく、Streamlit サーバー上に必要
-- 認証もサーバー側の `GH_TOKEN` / `gh auth` に依存
-- 複数ユーザーが自分の GitHub で使うなら、別途 GitHub OAuth が必要
-"""
-    )
-
 if not submitted:
-    st.info("左のパラメータを調整して `Estimate` を押してください。")
+    st.info("Adjust the parameters in the sidebar and press `Estimate`.")
+    st.stop()
+
+if not gh_status["authenticated"]:
+    st.error("GitHub CLI authentication is required. Run `gh auth login` and try again.")
     st.stop()
 
 try:
-    with st.spinner("GitHub activity を集計中..."):
+    with st.spinner("Collecting GitHub activity..."):
         result = run_estimate(
+            gh_identity,
             target_day.isoformat(),
             int(gap_minutes),
             int(min_single_minutes),
