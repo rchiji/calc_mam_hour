@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -11,10 +13,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 JST = timezone(timedelta(hours=9))
 UTC = timezone.utc
+GITHUB_API_BASE_URL = "https://api.github.com"
+GITHUB_API_VERSION = "2022-11-28"
+DEFAULT_ACCEPT = "application/vnd.github+json"
+COMMIT_SEARCH_ACCEPT = "application/vnd.github.cloak-preview+json"
 
 
 class GhCliError(RuntimeError):
@@ -48,61 +54,219 @@ class EstimateConfig:
     verbose: bool = False
 
 
-def run_gh(args: Sequence[str]) -> Tuple[int, str, str]:
-    cmd = ["gh", *args]
+def _gh_cli_not_found_message() -> str:
+    return "GitHub CLI `gh` was not found. Install GitHub CLI and run `gh auth login`."
+
+
+def _run_gh_command(args: List[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        raise GhCliError(_gh_cli_not_found_message())
+
     try:
-        completed = subprocess.run(
-            cmd,
-            check=False,
+        return subprocess.run(
+            [gh_path, *args],
             capture_output=True,
-            text=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
         )
-    except FileNotFoundError as exc:
-        raise GhCliError("gh CLI not found. Install GitHub CLI first.") from exc
-
-    stdout_text = (completed.stdout or b"").decode("utf-8", errors="replace")
-    stderr_text = (completed.stderr or b"").decode("utf-8", errors="replace")
-    return completed.returncode, stdout_text, stderr_text
+    except subprocess.TimeoutExpired as exc:
+        raise GhCliError(f"GitHub CLI request timed out after {timeout} seconds.") from exc
+    except OSError as exc:
+        raise GhCliError(f"Failed to run GitHub CLI: {exc}") from exc
 
 
-def run_gh_json(args: Sequence[str], allow_error_return: bool = False) -> Any:
-    rc, stdout_text, stderr_text = run_gh(args)
+def _combine_process_output(result: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part).strip()
 
-    if rc != 0:
-        msg = stderr_text.strip() or stdout_text.strip() or "gh command failed"
+
+def _normalize_cli_text(text: str) -> str:
+    return text.replace("✓", "OK").replace("✗", "X")
+
+
+def _extract_json_error_message(raw: str) -> str:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+
+    if not isinstance(payload, dict):
+        return ""
+
+    message = str(payload.get("message") or "").strip()
+    status = str(payload.get("status") or "").strip()
+    if message and status and status not in message:
+        return f"{message} (HTTP {status})"
+    return message or status
+
+
+def _format_gh_failure(result: subprocess.CompletedProcess[str]) -> str:
+    combined = _combine_process_output(result)
+    combined_lower = combined.lower()
+    if "gh auth login" in combined_lower or "not logged into any hosts" in combined_lower:
+        return "GitHub CLI is not authenticated. Run `gh auth login` and try again."
+
+    json_message = _extract_json_error_message(result.stdout)
+    if json_message:
+        return f"`gh api` error: {json_message}"
+
+    stderr_lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+    if stderr_lines:
+        last = stderr_lines[-1]
+        if last.startswith("gh: "):
+            last = last[4:].strip()
+        return f"`gh api` error: {last}"
+
+    if combined:
+        return f"`gh api` error: {combined}"
+
+    return "`gh api` request failed."
+
+
+def _gh_field_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _normalize_github_endpoint(endpoint: str) -> str:
+    if endpoint.startswith(GITHUB_API_BASE_URL):
+        endpoint = endpoint[len(GITHUB_API_BASE_URL) :]
+    elif endpoint.startswith("http"):
+        raise GhCliError(f"Unsupported `gh api` endpoint: {endpoint}")
+
+    return f"/{endpoint.lstrip('/')}"
+
+
+def get_gh_auth_status() -> Dict[str, Any]:
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        return {
+            "available": False,
+            "authenticated": False,
+            "login": "",
+            "detail": _gh_cli_not_found_message(),
+            "version": "",
+        }
+
+    version_line = ""
+    try:
+        version_result = _run_gh_command(["--version"])
+        for line in version_result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped:
+                version_line = stripped
+                break
+
+        status_result = _run_gh_command(["auth", "status"])
+    except GhCliError as exc:
+        return {
+            "available": True,
+            "authenticated": False,
+            "login": "",
+            "detail": str(exc),
+            "version": version_line,
+        }
+
+    status_text = _normalize_cli_text(_combine_process_output(status_result))
+
+    login = ""
+    match = re.search(r"Logged in to\s+\S+\s+account\s+([^\s(]+)", status_text)
+    if match:
+        login = match.group(1).strip()
+
+    authenticated = status_result.returncode == 0
+    detail = status_text
+    if not authenticated:
+        detail = _format_gh_failure(status_result)
+
+    return {
+        "available": True,
+        "authenticated": authenticated,
+        "login": login,
+        "detail": detail,
+        "version": version_line,
+    }
+
+
+def gh_api_request_json(
+    method: str,
+    endpoint: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    accept: str = DEFAULT_ACCEPT,
+    allow_error_return: bool = False,
+) -> Any:
+    if json_body is not None:
+        error = GhCliError("JSON request bodies are not supported in gh_api_request_json(). Use gh_graphql().")
         if allow_error_return:
-            raise RuntimeError(msg)
-        raise GhCliError(f"gh command failed.\nCommand: {' '.join(['gh', *args])}\nSTDERR: {msg}")
+            raise RuntimeError(str(error)) from error
+        raise error
 
-    if not stdout_text.strip():
+    filtered_params = {k: v for k, v in (params or {}).items() if v is not None}
+    command = [
+        "api",
+        _normalize_github_endpoint(endpoint),
+        "--method",
+        method.upper(),
+        "-H",
+        f"Accept: {accept}",
+        "-H",
+        f"X-GitHub-Api-Version: {GITHUB_API_VERSION}",
+    ]
+    for key, value in filtered_params.items():
+        command.extend(["-f", f"{key}={_gh_field_value(value)}"])
+
+    try:
+        result = _run_gh_command(command)
+    except GhCliError as exc:
+        if allow_error_return:
+            raise RuntimeError(str(exc)) from exc
+        raise
+
+    if result.returncode != 0:
+        message = _format_gh_failure(result)
+        if allow_error_return:
+            raise RuntimeError(message)
+        raise GhCliError(message)
+
+    payload_text = result.stdout.strip()
+    if not payload_text:
         return None
 
     try:
-        return json.loads(stdout_text)
-    except json.JSONDecodeError as exc:
-        msg = stdout_text[:2000]
+        return json.loads(payload_text)
+    except ValueError as exc:
+        message = payload_text[:2000]
         if allow_error_return:
-            raise RuntimeError(f"Failed to parse JSON from gh output:\n{msg}")
-        raise GhCliError(f"Failed to parse JSON from gh output.\n{msg}") from exc
+            raise RuntimeError(f"Failed to parse JSON from `gh api` response:\n{message}") from exc
+        raise GhCliError(f"Failed to parse JSON from `gh api` response.\n{message}") from exc
 
 
 def gh_api_get(
     endpoint: str,
     params: Optional[Dict[str, Any]] = None,
     allow_error_return: bool = False,
+    accept: str = DEFAULT_ACCEPT,
 ) -> Any:
-    args = ["api", "-X", "GET", endpoint]
-    for key, value in (params or {}).items():
-        if value is None:
-            continue
-        args.extend(["-f", f"{key}={value}"])
-    return run_gh_json(args, allow_error_return=allow_error_return)
+    return gh_api_request_json(
+        "GET",
+        endpoint,
+        params=params,
+        accept=accept,
+        allow_error_return=allow_error_return,
+    )
 
 
 def gh_api_paginated(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     per_page: int = 100,
+    accept: str = DEFAULT_ACCEPT,
 ) -> List[Any]:
     items: List[Any] = []
     page = 1
@@ -114,14 +278,8 @@ def gh_api_paginated(
         request_desc = path
 
         try:
-            if params is None:
-                sep = "&" if "?" in path else "?"
-                paged = f"{path}{sep}per_page={per_page}&page={page}"
-                request_desc = paged
-                data = run_gh_json(["api", paged], allow_error_return=True)
-            else:
-                data = gh_api_get(path, request_params, allow_error_return=True)
-                request_desc = f"{path} {request_params}"
+            data = gh_api_get(path, request_params, allow_error_return=True, accept=accept)
+            request_desc = f"{path} {request_params}"
         except RuntimeError as e:
             msg = str(e).lower()
             if "http 409" in msg and "repository is empty" in msg:
@@ -143,13 +301,28 @@ def gh_api_paginated(
 
 
 def gh_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
-    args = ["api", "graphql", "-f", f"query={query}"]
-    for k, v in variables.items():
-        if v is None:
+    command = [
+        "api",
+        "graphql",
+        "-H",
+        f"X-GitHub-Api-Version: {GITHUB_API_VERSION}",
+        "-f",
+        f"query={query}",
+    ]
+    for key, value in variables.items():
+        if value is None:
             continue
-        args.extend(["-F", f"{k}={v}"])
+        command.extend(["-f", f"{key}={_gh_field_value(value)}"])
 
-    data = run_gh_json(args, allow_error_return=False)
+    result = _run_gh_command(command)
+    if result.returncode != 0:
+        raise GhCliError(_format_gh_failure(result))
+
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        message = result.stdout[:2000]
+        raise GhCliError(f"Failed to parse JSON from `gh api graphql` response.\n{message}") from exc
 
     if data is None:
         raise RuntimeError("GraphQL response was empty")
@@ -159,6 +332,16 @@ def gh_graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError(f"GraphQL errors: {data['errors']}")
 
     return data
+
+
+def write_stdout(text: str) -> None:
+    if not text.endswith("\n"):
+        text += "\n"
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
+    sys.stdout.flush()
 
 
 def parse_args() -> argparse.Namespace:
@@ -323,6 +506,7 @@ def search_api_all(
     params: Dict[str, Any],
     per_page: int = 100,
     max_pages: int = 10,
+    accept: str = DEFAULT_ACCEPT,
 ) -> List[Dict[str, Any]]:
     """
     Generic paginated search collector.
@@ -334,7 +518,7 @@ def search_api_all(
         request_params = dict(params)
         request_params["per_page"] = per_page
         request_params["page"] = page
-        data = gh_api_get(endpoint, request_params, allow_error_return=True)
+        data = gh_api_get(endpoint, request_params, allow_error_return=True, accept=accept)
         if not isinstance(data, dict):
             break
         batch = data.get("items") or []
@@ -365,6 +549,7 @@ def search_repos_by_commit(
             },
             per_page=100,
             max_pages=10,
+            accept=COMMIT_SEARCH_ACCEPT,
         )
     except RuntimeError as e:
         if verbose:
@@ -1139,10 +1324,10 @@ def main() -> None:
         sys.exit(2)
 
     if args.json:
-        print(json.dumps(build_json_payload(result), ensure_ascii=False, indent=2))
+        write_stdout(json.dumps(build_json_payload(result), ensure_ascii=False, indent=2))
         return
 
-    print(
+    write_stdout(
         render_text_report(
             target_day=result["target_day"],
             viewer_login=result["viewer_login"],
